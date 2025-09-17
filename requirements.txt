@@ -1,0 +1,4 @@
+playwright>=1.43.0,<2
+# Optional OS-level mouse fallback (Windows)
+pyautogui>=0.9.54; platform_system == "Windows"
+python-dotenv>=1.0.1
