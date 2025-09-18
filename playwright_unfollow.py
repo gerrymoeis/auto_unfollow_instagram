@@ -56,9 +56,12 @@ from typing import List, Tuple, Optional
 
 from playwright.async_api import async_playwright, Page
 from dotenv import load_dotenv
+from rich.console import Console
+from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, SpinnerColumn
 
 # -------------------- CONFIG (via .env with safe defaults) --------------------
 load_dotenv()
+console = Console()
 
 def env_str(key: str, default: str) -> str:
     return os.getenv(key, default)
@@ -90,6 +93,7 @@ DAILY_CAP: int = env_int("DAILY_CAP", 80)
 PER_HOUR_CAP: int = env_int("PER_HOUR_CAP", 30)
 MIN_DELAY_SEC: int = env_int("MIN_DELAY_SEC", 20)
 MAX_DELAY_SEC: int = env_int("MAX_DELAY_SEC", 60)
+MAX_NO_PROGRESS_ROUNDS: int = env_int("MAX_NO_PROGRESS_ROUNDS", 6)
 
 # Selectors tuned to provided HTML: dialog + any buttons inside; filter by text/aria containing 'Following'
 FOLLOWING_DIALOG_SELECTOR: str = 'div[role="dialog"]'
@@ -126,10 +130,13 @@ SUGGESTED_HEADER_TOKENS = (
 
 # -------------------- UTILITIES --------------------
 
-def log(msg: str) -> None:
+def log(msg: str, style: str | None = None) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
-    print(line)
+    if style:
+        console.print(line, style=style)
+    else:
+        console.print(line)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
@@ -351,25 +358,42 @@ async def run_once() -> None:
     seen_usernames: set[str] = set()
     unfollowed_usernames: list[str] = []
     before_count = await _get_following_count(page)
+
+    # Setup progress bar (indeterminate if before_count is unknown)
+    bar = BarColumn(bar_width=None, pulse=True)
+    progress = Progress(
+        SpinnerColumn(style="cyan"),
+        TextColumn("[bold green]Unfollow[/bold green]"),
+        bar,
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        TextColumn("•"),
+        TextColumn("{task.fields[detail]}"),
+        console=console,
+    )
+    progress.start()
+    task_total = before_count if before_count is not None else None
+    task = progress.add_task("run", total=task_total, fields={"detail": "initializing..."})
     processed_usernames: set[str] = set()  # usernames either unfollowed or skipped (whitelist)
     skipped_whitelist_usernames: list[str] = []
     no_action_rounds = 0
 
     while True:
         if killswitch_triggered():
-            log("Killswitch detected. Stopping run.")
+            log("Killswitch detected. Stopping run.", style="bold red")
             break
         if actions >= MAX_ACTIONS_PER_RUN:
-            log("Reached MAX_ACTIONS_PER_RUN. Stopping run.")
+            log("Reached MAX_ACTIONS_PER_RUN. Stopping run.", style="yellow")
             break
         if state["daily_unfollows"][today] >= DAILY_CAP:
-            log("Reached DAILY_CAP. Stopping run.")
+            log("Reached DAILY_CAP. Stopping run.", style="yellow")
             break
         # per-hour cap check (actual actions within last 3600s)
         now = time.time()
         recent_actions = [t for t in recent_actions if now - t < 3600]
         if len(recent_actions) >= PER_HOUR_CAP:
-            log("Reached PER_HOUR_CAP (last 60 minutes). Stopping run.")
+            log("Reached PER_HOUR_CAP (last 60 minutes). Stopping run.", style="yellow")
             break
 
         # enumerate all buttons in dialog (or whole page if no dialog); filter to 'Following'
@@ -394,14 +418,15 @@ async def run_once() -> None:
                             except Exception:
                                 ht = ""
                             if any(tok in ht for tok in SUGGESTED_HEADER_TOKENS):
-                                log("Reached 'Suggested for you' section. Ending.")
+                                log("Reached 'Suggested for you' section. Ending.", style="cyan")
                                 stable_no_new = 999  # force break
                                 break
                 except Exception:
                     pass
-            if stable_no_new > 6:
-                log("No buttons found after multiple scrolls. Ending.")
+            if stable_no_new >= MAX_NO_PROGRESS_ROUNDS:
+                log("No buttons found after multiple scrolls. Ending.", style="yellow")
                 break
+            progress.update(task, fields={"detail": f"scrolling ({stable_no_new})"})
             continue
         else:
             stable_no_new = 0
@@ -496,7 +521,7 @@ async def run_once() -> None:
                     continue
                 if username in whitelist:
                     if username not in processed_usernames:
-                        log(f"Skip (whitelist): {username}")
+                        log(f"Skip (whitelist): {username}", style="yellow")
                         skipped_whitelist_usernames.append(username)
                         processed_usernames.add(username)
                         seen_usernames.add(username)
@@ -521,7 +546,7 @@ async def run_once() -> None:
 
                 await _highlight_box(page, box, "#ffd60a", 700)
 
-                log(f"[Target] {username} | btn='{btn_text}'")
+                log(f"[Target] {username} | btn='{btn_text}'", style="cyan")
                 seen_usernames.add(username)
 
                 # move cursor along curved path
@@ -539,13 +564,17 @@ async def run_once() -> None:
                     await client.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": bx, "y": by, "button": "left", "clickCount": 1})
                     await asyncio.sleep(random.uniform(0.06, 0.18))
                     await client.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": bx, "y": by, "button": "left", "clickCount": 1})
-                    log(f"Clicked initial button for {username}")
+                    log(f"Clicked initial button for {username}", style="green")
 
                     # wait & detect confirm dialog
                     await asyncio.sleep(random.uniform(0.6, 1.2))
                     body_text = (await page.inner_text("body")).lower()
                     if any(p in body_text for p in BLOCK_PATTERNS):
-                        log("Block-like text detected. Stopping.")
+                        log("Block-like text detected. Stopping.", style="bold red")
+                        try:
+                            progress.stop()
+                        except Exception:
+                            pass
                         await client.detach()
                         return
 
@@ -574,11 +603,11 @@ async def run_once() -> None:
                             await client.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": cbx, "y": cby, "button": "left", "clickCount": 1})
                             await asyncio.sleep(random.uniform(0.06, 0.2))
                             await client.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": cbx, "y": cby, "button": "left", "clickCount": 1})
-                            log("Clicked confirm unfollow")
+                            log("Clicked confirm unfollow", style="green")
                         else:
-                            log("Confirm button bbox missing; skipped confirm.")
+                            log("Confirm button bbox missing; skipped confirm.", style="yellow")
                     else:
-                        log("No confirm button found (maybe immediate unfollow).")
+                        log("No confirm button found (maybe immediate unfollow).", style="yellow")
 
                     # verify the row button changed to 'Follow/Ikuti'
                     verified = False
@@ -604,16 +633,16 @@ async def run_once() -> None:
                         await asyncio.sleep(0.5)
 
                     if verified:
-                        log("Verified state changed to 'Follow/Ikuti'.")
+                        log("Verified state changed to 'Follow/Ikuti'.", style="green")
                     else:
-                        log("WARN: Could not verify state change to 'Follow/Ikuti' — counting with caution.")
+                        log("WARN: Could not verify state change to 'Follow/Ikuti' — counting with caution.", style="yellow")
 
                     # update state on actual actions
                     state["daily_unfollows"][today] = state["daily_unfollows"].get(today, 0) + 1
                     state["total"] = state.get("total", 0) + 1
                     recent_actions.append(time.time())
                     save_state(state)
-                    log(f"Persisted: daily[{today}]={state['daily_unfollows'][today]} total={state['total']}")
+                    log(f"Persisted: daily[{today}]={state['daily_unfollows'][today]} total={state['total']}", style="dim")
                     unfollowed_usernames.append(username)
                     processed_usernames.add(username)
 
@@ -621,7 +650,7 @@ async def run_once() -> None:
 
                 # delay between actions
                 delay = random.uniform(MIN_DELAY_SEC, MAX_DELAY_SEC)
-                log(f"Sleeping ~{int(delay)}s before next action (actions={actions}).")
+                log(f"Sleeping ~{int(delay)}s before next action (actions={actions}).", style="dim")
                 slept = 0.0
                 while slept < delay:
                     if killswitch_triggered():
@@ -635,7 +664,11 @@ async def run_once() -> None:
                 # post-action block check
                 body_text = (await page.inner_text("body")).lower()
                 if any(p in body_text for p in BLOCK_PATTERNS):
-                    log("Block-like text detected after action. Stopping.")
+                    log("Block-like text detected after action. Stopping.", style="bold red")
+                    try:
+                        progress.stop()
+                    except Exception:
+                        pass
                     await client.detach()
                     return
 
@@ -644,13 +677,13 @@ async def run_once() -> None:
                     break
 
             except Exception as e:
-                log(f"Error processing item: {e}")
+                log(f"Error processing item: {e}", style="bold red")
                 await asyncio.sleep(1.0)
                 continue
 
         # if we have processed as many unique usernames as reported in the initial header, finish
         if before_count is not None and len(processed_usernames) >= before_count:
-            log(f"Processed {len(processed_usernames)} usernames (header reported {before_count}). Finishing to avoid loops.")
+            log(f"Processed {len(processed_usernames)} usernames (header reported {before_count}). Finishing to avoid loops.", style="cyan")
             break
 
         # detect no-progress cycles (e.g., whitelists repeating)
@@ -658,8 +691,8 @@ async def run_once() -> None:
             no_action_rounds += 1
         else:
             no_action_rounds = 0
-        if no_action_rounds > 6:
-            log("No new usernames processed after multiple cycles — ending to avoid whitelist loops.")
+        if no_action_rounds >= MAX_NO_PROGRESS_ROUNDS:
+            log("No new usernames processed after multiple cycles — ending to avoid whitelist loops.", style="yellow")
             break
 
         # load more: prefer scrolling last 'Following' button into view to keep position stable
@@ -671,6 +704,19 @@ async def run_once() -> None:
             else:
                 await client.send("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": scroll_x, "y": scroll_y, "deltaX": 0, "deltaY": random.randint(320, 520)})
                 await asyncio.sleep(random.uniform(0.9, 1.4))
+        except Exception:
+            pass
+
+        # Update progress details for the bar
+        try:
+            processed = len(processed_usernames)
+            rem = (before_count - processed) if before_count is not None else "?"
+            detail = f"proc:{processed} unf:{len(unfollowed_usernames)} skip:{len(skipped_whitelist_usernames)} rem:{rem} act:{actions}"
+            # If total unknown initially and now known, set it
+            if before_count is not None and progress.tasks[0].total is None:
+                progress.update(task, total=before_count)
+            completed_val = processed if before_count is not None else 0
+            progress.update(task, completed=completed_val, fields={"detail": detail})
         except Exception:
             pass
 
@@ -702,7 +748,7 @@ async def run_once() -> None:
                             if suggested_reached:
                                 hbox = await h.bounding_box()
                                 await _highlight_box(page, hbox, "#0a84ff", 800)
-                                log("Detected 'Suggested for you' with Follow buttons after it — finishing.")
+                                log("Detected 'Suggested for you' with Follow buttons after it — finishing.", style="cyan")
                                 stable_no_new = 999
                                 break
             except Exception:
@@ -715,11 +761,15 @@ async def run_once() -> None:
         else:
             stable_no_new = 0
         last_visible = len(new_buttons)
-        if stable_no_new > 6:
-            log("No new buttons loaded after multiple scrolls. Ending.")
+        if stable_no_new >= MAX_NO_PROGRESS_ROUNDS:
+            log("No new buttons loaded after multiple scrolls. Ending.", style="yellow")
             break
 
     # summary
+    try:
+        progress.stop()
+    except Exception:
+        pass
     # attempt to close dialog, reload page, and measure following count reliably
     await _close_dialog_if_open(page)
     try:
@@ -733,6 +783,8 @@ async def run_once() -> None:
         if after_count is not None:
             break
         await asyncio.sleep(0.6)
+    proc_total = len(processed_usernames)
+    log(f"Summary: Processed {proc_total} accounts (unf:{len(unfollowed_usernames)} skip:{len(skipped_whitelist_usernames)})", style="cyan")
     if unfollowed_usernames:
         names = ", ".join(unfollowed_usernames)
         log(f"Summary: Unfollowed {len(unfollowed_usernames)} accounts: {names}")
@@ -761,8 +813,8 @@ async def run_once() -> None:
 
 
 async def main() -> None:
-    log("=== Playwright Unfollow Tool START ===")
-    log(f"DRY_RUN={DRY_RUN}; using whitelist file '{WHITELIST_FILE}'")
+    log("=== Playwright Unfollow Tool START ===", style="bold cyan")
+    log(f"DRY_RUN={DRY_RUN}; using whitelist file '{WHITELIST_FILE}'", style="cyan")
     try:
         await run_once()
     except asyncio.CancelledError:
